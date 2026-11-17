@@ -52,6 +52,7 @@ from azul.lib.types import (
 from azul.oauth2 import (
     Authorization,
     InvalidAccessTokenError,
+    InvalidRefreshTokenError,
 )
 from azul.openapi import (
     application_json,
@@ -293,6 +294,67 @@ class UserController(Controller):
             return self._revoke()
 
         @self.app.route(
+            '/user/reauthorize',
+            methods=['POST'],
+            cors=True,
+            spec={
+                'summary': 'Obtain a fresh OAuth 2.0 access token '
+                           'in exchange for one that is about to expire',
+                'description': fd('''
+                    Exchange the OAuth 2.0 access token in the `Authorization`
+                    header, passed as a Bearer token, for a fresh one. The user
+                    must have previously completed the authorization code flow.
+                    If the access token remains valid for more than
+                    {minutes} minutes, it is returned unchanged.
+                ''', minutes=self._service.reauthorization_window // 60),
+                'tags': ['User'],
+                'responses': {
+                    '200': {
+                        'description': fd('''
+                            The access token, or a fresh one if it was about to
+                            expire
+                        '''),
+                        **json_content(
+                            object(
+                                access_token=describe(str, fd('''
+                                    An access token for the user
+                                ''')),
+                                expires_in=describe(int, fd('''
+                                    Expiration of the access token, in seconds
+                                ''')),
+                                scope=describe(nullable(str), fd('''
+                                    The scopes granted by the user, or `null`
+                                    if the access token is returned unchanged
+                                ''')),
+                                token_type=describe(str, fd('''
+                                    Always 'Bearer'
+                                ''')),
+                                id_token=optional(describe(str, fd('''
+                                    The OIDC ID token identifying the user,
+                                    absent if the access token is returned
+                                    unchanged
+                                ''')))
+                            )
+                        )
+                    },
+                    **self._user_error_responses,
+                    '401': {
+                        'description': fd('''
+                            No valid OAuth 2.0 access token was provided, the
+                            user has not completed the authorization code flow,
+                            or the access token is about to expire and the
+                            user's authorization of this application has
+                            lapsed. In the latter case, the user must authorize
+                            this application again.
+                        ''')
+                    }
+                }
+            }
+        )
+        def reauthorize():
+            return self._reauthorize()
+
+        @self.app.route(
             '/user',
             methods=['GET'],
             cors=True,
@@ -498,6 +560,17 @@ class UserController(Controller):
         with self._rejecting_unusable_token():
             self._service.revoke_personal_access_tokens(auth)
         return Response(status_code=204, body='')
+
+    def _reauthorize(self) -> JSON:
+        auth = self._access_token('Cannot reauthorize with a personal access token')
+        with self._rejecting_unusable_token():
+            try:
+                response = self._service.reauthorize(auth)
+            except InvalidRefreshTokenError:
+                raise UnauthorizedError("The user's authorization of this "
+                                        'application was revoked or has expired. '
+                                        'Authorize this application again.')
+        return json_untyped_dict(response)
 
     @property
     def _user_schema(self) -> JSON:
